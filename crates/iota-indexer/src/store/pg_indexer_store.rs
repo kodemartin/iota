@@ -17,6 +17,7 @@ use diesel::{
     upsert::excluded,
 };
 use downcast::Any;
+use futures::{StreamExt, TryStreamExt};
 use iota_protocol_config::ProtocolConfig;
 use iota_types::{
     base_types::ObjectID,
@@ -1870,11 +1871,16 @@ impl IndexerStore for PgIndexerStore {
             .collect::<Vec<_>>();
         let len = objects_snapshot.len();
         let chunks = chunk!(objects_snapshot, self.config.parallel_objects_chunk_size);
-        let futures = chunks
-            .into_iter()
-            .map(|c| self.spawn_blocking_task(move |this| this.backfill_objects_snapshot_chunk(c)));
-
-        futures::future::try_join_all(futures)
+        // Throttle the parallel write to avoid exceeding the max-number of tokio
+        // blocking threads
+        futures::stream::iter(chunks)
+            .map(|c| async move {
+                // spawn lazily
+                self.spawn_blocking_task(move |this| this.backfill_objects_snapshot_chunk(c))
+                    .await
+            })
+            .buffer_unordered(100)
+            .try_collect::<Vec<_>>()
             .await
             .map_err(|e| {
                 tracing::error!("failed to join backfill_objects_snapshot_chunk futures: {e}");
