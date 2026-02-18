@@ -929,17 +929,22 @@ impl IndexerMetrics {
 
 pub fn spawn_connection_pool_metric_collector(
     metrics: IndexerMetrics,
-    connection_pool: crate::db::ConnectionPool,
+    connection_pools: Vec<crate::db::ConnectionPool>,
 ) {
     tokio::spawn(async move {
         loop {
-            let cp_state = connection_pool.state();
+            let (total_connections, idle_connections) =
+                connection_pools.iter().fold((0, 0), |(total, idle), pool| {
+                    let state = pool.state();
+                    (total + state.connections, idle + state.connections)
+                });
+
             tracing::debug!(
-                connection_pool_size =% cp_state.connections,
-                idle_connections =% cp_state.idle_connections,
+                connection_pool_size =% total_connections,
+                idle_connections =% idle_connections,
             );
-            metrics.db_conn_pool_size.set(cp_state.connections as i64);
-            metrics.idle_db_conn.set(cp_state.idle_connections as i64);
+            metrics.db_conn_pool_size.set(total_connections as i64);
+            metrics.idle_db_conn.set(idle_connections as i64);
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
         }
     });

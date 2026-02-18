@@ -54,15 +54,19 @@ async fn main() -> Result<(), IndexerError> {
         return Ok(());
     }
 
-    let connection_pool = new_connection_pool(
-        opts.database_url
-            .ok_or(IndexerError::InvalidArgument(
-                "--database-url argument is mandatory for this command".into(),
-            ))?
-            .as_str(),
-        &opts.connection_pool_config,
-    )?;
-    spawn_connection_pool_metric_collector(indexer_metrics.clone(), connection_pool.clone());
+    let database_url = opts
+        .database_url
+        .ok_or(IndexerError::InvalidArgument(
+            "--database-url argument is mandatory for this command".into(),
+        ))?
+        .to_string();
+    let connection_pool = new_connection_pool(&database_url, &opts.connection_pool_config)?;
+    if !matches!(opts.command, Command::Indexer { .. }) {
+        spawn_connection_pool_metric_collector(
+            indexer_metrics.clone(),
+            vec![connection_pool.clone()],
+        );
+    }
 
     match opts.command {
         Command::Indexer {
@@ -86,10 +90,10 @@ async fn main() -> Result<(), IndexerError> {
                 }
             }
 
-            let store = PgIndexerStore::new(connection_pool, indexer_metrics.clone());
             Indexer::start_writer_with_config(
                 &ingestion_config,
-                store,
+                database_url,
+                opts.connection_pool_config,
                 indexer_metrics,
                 snapshot_config,
                 retention_config,

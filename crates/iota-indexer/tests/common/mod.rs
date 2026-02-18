@@ -20,7 +20,9 @@ use iota_indexer::{
     read_only_blocking,
     schema::optimistic_transactions,
     store::{PgIndexerStore, indexer_store::IndexerStore},
-    test_utils::{DBInitHook, IndexerTypeConfig, create_pg_store, db_url, start_test_indexer},
+    test_utils::{
+        DBInitHook, IndexerTypeConfig, TestDatabase, create_pg_store, db_url, start_test_indexer,
+    },
 };
 use iota_json_rpc_api::{
     CoinReadApiClient, ReadApiClient, TransactionBuilderClient, WriteApiClient,
@@ -393,7 +395,8 @@ fn start_indexer_reader(fullnode_rpc_url: impl Into<String>, database_name: Opti
     init_metrics(&registry);
     let metrics = IndexerMetrics::new(&registry);
 
-    let store = create_pg_store(&db_url, false);
+    let mut test_db = TestDatabase::new(db_url);
+    let store = create_pg_store(&mut test_db, metrics.clone(), false);
 
     tokio::spawn(
         async move { Indexer::start_reader(&config, store, &registry, pool, metrics).await },

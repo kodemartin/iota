@@ -16,25 +16,97 @@ use crate::{
     config::{
         HistoricFallbackOptions, IngestionConfig, JsonRpcConfig, RetentionConfig, SnapshotLagConfig,
     },
-    db::ConnectionPool,
+    db::{ConnectionPool, ConnectionPoolConfig, new_connection_pool},
     errors::IndexerError,
     historical_fallback::reader::HistoricalFallbackReader,
     ingestion::{
         primary::orchestration::PrimaryPipeline, snapshot::orchestration::SnapshotPipelineBuilder,
     },
-    metrics::IndexerMetrics,
+    metrics::{IndexerMetrics, spawn_connection_pool_metric_collector},
     processors::processor_orchestrator::ProcessorOrchestrator,
     pruning::{optimistic_pruner::OptimisticPruner, pruner::Pruner},
     read::IndexerReader,
     store::{IndexerAnalyticalStore, IndexerStore, PgIndexerStore},
 };
 
+#[derive(Debug, Clone, Copy)]
+struct ConnectionDistribution {
+    total_connections: u32,
+}
+
+impl ConnectionDistribution {
+    const PRIMARY: u32 = 80;
+    const SNAPSHOT: u32 = 10;
+    const PRUNER: u32 = 10;
+    const TOTAL: u32 = Self::PRIMARY + Self::SNAPSHOT + Self::PRUNER;
+
+    fn new(total_connections: u32) -> Self {
+        Self { total_connections }
+    }
+    fn primary_pool_size(&self) -> u32 {
+        self.total_connections * Self::PRIMARY / Self::TOTAL
+    }
+
+    fn snapshot_pool_size(&self) -> u32 {
+        self.total_connections * Self::SNAPSHOT / Self::TOTAL
+    }
+
+    fn pruner_pool_size(&self) -> u32 {
+        self.total_connections * Self::PRUNER / Self::TOTAL
+    }
+
+    fn non_distributed(&self) -> u32 {
+        self.total_connections
+            - self.primary_pool_size()
+            - self.snapshot_pool_size()
+            - self.pruner_pool_size()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PoolBuilder {
+    db_url: String,
+    config: ConnectionPoolConfig,
+    distribution: ConnectionDistribution,
+}
+
+impl PoolBuilder {
+    fn new(db_url: String, config: ConnectionPoolConfig) -> Self {
+        let distribution = ConnectionDistribution::new(config.pool_size);
+        Self {
+            db_url,
+            config,
+            distribution,
+        }
+    }
+
+    fn primary_pool(&self) -> Result<ConnectionPool, IndexerError> {
+        let mut config = self.config.clone();
+        config.pool_size =
+            self.distribution.primary_pool_size() + self.distribution.non_distributed();
+        new_connection_pool(&self.db_url, &config)
+    }
+
+    fn snapshot_pool(&self) -> Result<ConnectionPool, IndexerError> {
+        let mut config = self.config.clone();
+        config.pool_size = self.distribution.snapshot_pool_size();
+        new_connection_pool(&self.db_url, &config)
+    }
+
+    fn pruner_pool(&self) -> Result<ConnectionPool, IndexerError> {
+        let mut config = self.config.clone();
+        config.pool_size = self.distribution.pruner_pool_size();
+        new_connection_pool(&self.db_url, &config)
+    }
+}
+
 pub struct Indexer;
 
 impl Indexer {
     pub async fn start_writer_with_config(
         config: &IngestionConfig,
-        store: PgIndexerStore,
+        database_url: String,
+        connection_config: ConnectionPoolConfig,
         metrics: IndexerMetrics,
         snapshot_config: SnapshotLagConfig,
         retention_config: Option<RetentionConfig>,
@@ -64,8 +136,25 @@ impl Indexer {
             .as_ref()
             .map(|url| url.as_str().to_owned());
 
+        let pool_builder = PoolBuilder::new(database_url, connection_config);
+        let primary_pool = pool_builder.primary_pool()?;
+        let snapshot_pool = pool_builder.snapshot_pool()?;
+        let pruner_pool = pool_builder.pruner_pool()?;
+        spawn_connection_pool_metric_collector(
+            metrics.clone(),
+            vec![
+                primary_pool.clone(),
+                snapshot_pool.clone(),
+                pruner_pool.clone(),
+            ],
+        );
+
+        let primary_store = PgIndexerStore::new(primary_pool, metrics.clone());
+        let snapshot_store = PgIndexerStore::new(snapshot_pool, metrics.clone());
+        let pruner_store = PgIndexerStore::new(pruner_pool, metrics.clone());
+
         if let Some(retention_config) = retention_config {
-            let pruner = Pruner::new(store.clone(), retention_config, metrics.clone())?;
+            let pruner = Pruner::new(pruner_store.clone(), retention_config, metrics.clone())?;
             let cancel_clone = cancel.clone();
             spawn_monitored_task!(pruner.start(cancel_clone));
         }
@@ -73,7 +162,7 @@ impl Indexer {
         if let Some(optimistic_pruner_batch_size) = optimistic_pruner_batch_size {
             info!("Starting indexer optimistic tables pruner");
             let optimistic_pruner = OptimisticPruner::new(
-                store.clone(),
+                pruner_store.clone(),
                 optimistic_pruner_batch_size,
                 metrics.clone(),
             )?;
@@ -87,12 +176,12 @@ impl Indexer {
         // been indexed), then we persist protocol configs for protocol versions
         // not yet in the db. Otherwise, we would do the persisting in
         // `commit_checkpoint` while the first cp is being indexed.
-        if let Some(chain_id) = IndexerStore::get_chain_identifier(&store).await? {
-            store.persist_protocol_configs_and_feature_flags(chain_id)?;
+        if let Some(chain_id) = IndexerStore::get_chain_identifier(&primary_store).await? {
+            primary_store.persist_protocol_configs_and_feature_flags(chain_id)?;
         }
 
         let mut primary_pipeline = PrimaryPipeline::setup(
-            store.clone(),
+            primary_store,
             metrics.clone(),
             config.checkpoint_download_queue_size,
             cancel.clone(),
@@ -100,7 +189,7 @@ impl Indexer {
         .await?;
 
         let snapshot_pipeline_builder = SnapshotPipelineBuilder::new(
-            store.clone(),
+            snapshot_store,
             metrics.clone(),
             snapshot_config,
             config.checkpoint_download_queue_size,
