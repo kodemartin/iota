@@ -1870,7 +1870,10 @@ impl IndexerStore for PgIndexerStore {
             )
             .collect::<Vec<_>>();
         let len = objects_snapshot.len();
-        let chunks = chunk!(objects_snapshot, self.config.parallel_objects_chunk_size);
+        let snapshot_parallel_writes = (self.blocking_cp.max_size() * 2) as usize;
+        let chunk_size =
+            (len / snapshot_parallel_writes).clamp(self.config.parallel_objects_chunk_size, 10_000);
+        let chunks = chunk!(objects_snapshot, chunk_size);
         // Throttle the parallel write to avoid exceeding the max-number of tokio
         // blocking threads
         futures::stream::iter(chunks)
@@ -1879,7 +1882,7 @@ impl IndexerStore for PgIndexerStore {
                 self.spawn_blocking_task(move |this| this.backfill_objects_snapshot_chunk(c))
                     .await
             })
-            .buffer_unordered(100)
+            .buffer_unordered(snapshot_parallel_writes)
             .try_collect::<Vec<_>>()
             .await
             .map_err(|e| {
@@ -2397,10 +2400,7 @@ impl IndexerStore for PgIndexerStore {
             })?;
 
         let elapsed = guard.stop_and_record();
-        info!(
-            elapsed,
-            "Persisted objects with {mutation_len} mutations and {deletion_len} deletions",
-        );
+        info!(elapsed, "Persisted {} objects", mutation_len + deletion_len);
         Ok(())
     }
 
