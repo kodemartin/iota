@@ -1773,16 +1773,6 @@ impl PgIndexerStore {
             f(this)
         })
     }
-
-    fn spawn_task<F, Fut, R>(&self, f: F) -> tokio::task::JoinHandle<Result<R, IndexerError>>
-    where
-        F: FnOnce(Self) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = Result<R, IndexerError>> + Send + 'static,
-        R: Send + 'static,
-    {
-        let this = self.clone();
-        tokio::task::spawn(async move { f(this).await })
-    }
 }
 
 #[async_trait]
@@ -1923,12 +1913,20 @@ impl IndexerStore for PgIndexerStore {
             .start_timer();
 
         let len = objects.len();
-        let chunks = chunk!(objects, self.config.parallel_objects_chunk_size);
-        let futures = chunks
-            .into_iter()
-            .map(|c| self.spawn_blocking_task(move |this| this.persist_objects_history_chunk(c)));
-
-        futures::future::try_join_all(futures)
+        let parallel_writes = (self.blocking_cp.max_size() * 2) as usize;
+        let chunk_size =
+            (len / parallel_writes).clamp(self.config.parallel_objects_chunk_size, 10_000);
+        let chunks = chunk!(objects, chunk_size);
+        // Throttle the parallel write to avoid exceeding the max-number of tokio
+        // blocking threads
+        futures::stream::iter(chunks)
+            .map(|c| async move {
+                // spawn lazily
+                self.spawn_blocking_task(move |this| this.persist_objects_history_chunk(c))
+                    .await
+            })
+            .buffer_unordered(parallel_writes)
+            .try_collect::<Vec<_>>()
             .await
             .map_err(|e| {
                 tracing::error!("failed to join persist_objects_history_chunk futures: {e}");
@@ -1960,14 +1958,20 @@ impl IndexerStore for PgIndexerStore {
             .start_timer();
 
         let object_versions_count = object_versions.len();
-
-        let chunks = chunk!(object_versions, self.config.parallel_objects_chunk_size);
-        let futures = chunks
-            .into_iter()
-            .map(|c| self.spawn_blocking_task(move |this| this.persist_object_version_chunk(c)))
-            .collect::<Vec<_>>();
-
-        futures::future::try_join_all(futures)
+        let parallel_writes = (self.blocking_cp.max_size() * 2) as usize;
+        let chunk_size = (object_versions_count / parallel_writes)
+            .clamp(self.config.parallel_objects_chunk_size, 10_000);
+        let chunks = chunk!(object_versions, chunk_size);
+        // Throttle the parallel write to avoid exceeding the max-number of tokio
+        // blocking threads
+        futures::stream::iter(chunks)
+            .map(|c| async move {
+                // spawn lazily
+                self.spawn_blocking_task(move |this| this.persist_object_version_chunk(c))
+                    .await
+            })
+            .buffer_unordered(parallel_writes)
+            .try_collect::<Vec<_>>()
             .await
             .map_err(|e| {
                 tracing::error!("failed to join persist_object_version_chunk futures: {e}");
@@ -2002,13 +2006,19 @@ impl IndexerStore for PgIndexerStore {
             .checkpoint_db_commit_latency_transactions
             .start_timer();
         let len = transactions.len();
-
-        let chunks = chunk!(transactions, self.config.parallel_chunk_size);
-        let futures = chunks
-            .into_iter()
-            .map(|c| self.spawn_blocking_task(move |this| this.persist_transactions_chunk(c)));
-
-        futures::future::try_join_all(futures)
+        let parallel_writes = (self.blocking_cp.max_size() * 2) as usize;
+        let chunk_size = (len / parallel_writes).clamp(self.config.parallel_chunk_size, 10_000);
+        let chunks = chunk!(transactions, chunk_size);
+        // Throttle the parallel write to avoid exceeding the max-number of tokio
+        // blocking threads
+        futures::stream::iter(chunks)
+            .map(|c| async move {
+                // spawn lazily
+                self.spawn_blocking_task(move |this| this.persist_transactions_chunk(c))
+                    .await
+            })
+            .buffer_unordered(parallel_writes)
+            .try_collect::<Vec<_>>()
             .await
             .map_err(|e| {
                 tracing::error!("failed to join persist_transactions_chunk futures: {e}");
@@ -2044,12 +2054,19 @@ impl IndexerStore for PgIndexerStore {
             .metrics
             .checkpoint_db_commit_latency_events
             .start_timer();
-        let chunks = chunk!(events, self.config.parallel_chunk_size);
-        let futures = chunks
-            .into_iter()
-            .map(|c| self.spawn_blocking_task(move |this| this.persist_events_chunk(c)));
-
-        futures::future::try_join_all(futures)
+        let parallel_writes = (self.blocking_cp.max_size() * 2) as usize;
+        let chunk_size = (len / parallel_writes).clamp(self.config.parallel_chunk_size, 10_000);
+        let chunks = chunk!(events, chunk_size);
+        // Throttle the parallel write to avoid exceeding the max-number of tokio
+        // blocking threads
+        futures::stream::iter(chunks)
+            .map(|c| async move {
+                // spawn lazily
+                self.spawn_blocking_task(move |this| this.persist_events_chunk(c))
+                    .await
+            })
+            .buffer_unordered(parallel_writes)
+            .try_collect::<Vec<_>>()
             .await
             .map_err(|e| {
                 tracing::error!("failed to join persist_events_chunk futures: {e}");
@@ -2119,22 +2136,16 @@ impl IndexerStore for PgIndexerStore {
             .metrics
             .checkpoint_db_commit_latency_event_indices
             .start_timer();
-        let chunks = chunk!(indices, self.config.parallel_chunk_size);
-
-        let futures = chunks.into_iter().map(|chunk| {
-            self.spawn_task(move |this: Self| async move {
-                this.persist_event_indices_chunk(chunk).await
-            })
-        });
-
-        futures::future::try_join_all(futures)
+        let parallel_writes = (self.blocking_cp.max_size() * 2) as usize;
+        let chunk_size = (len / parallel_writes).clamp(self.config.parallel_chunk_size, 10_000);
+        let chunks = chunk!(indices, chunk_size);
+        // Throttle the parallel write to avoid exceeding the max-number of tokio
+        // blocking threads
+        futures::stream::iter(chunks)
+            .map(|c| self.persist_event_indices_chunk(c))
+            .buffer_unordered(parallel_writes)
+            .try_collect::<Vec<_>>()
             .await
-            .map_err(|e| {
-                tracing::error!("failed to join persist_event_indices_chunk futures: {e}");
-                IndexerError::from(e)
-            })?
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
             .map_err(|e| {
                 IndexerError::PostgresWrite(format!(
                     "Failed to persist all event_indices chunks: {e:?}"
@@ -2336,21 +2347,16 @@ impl IndexerStore for PgIndexerStore {
             .metrics
             .checkpoint_db_commit_latency_tx_indices
             .start_timer();
-        let chunks = chunk!(indices, self.config.parallel_chunk_size);
-
-        let futures = chunks.into_iter().map(|chunk| {
-            self.spawn_task(move |this: Self| async move {
-                this.persist_tx_indices_chunk_v2(chunk).await
-            })
-        });
-        futures::future::try_join_all(futures)
+        let parallel_writes = (self.blocking_cp.max_size() * 2) as usize;
+        let chunk_size = (len / parallel_writes).clamp(self.config.parallel_chunk_size, 10_000);
+        let chunks = chunk!(indices, chunk_size);
+        // Throttle the parallel write to avoid exceeding the max-number of tokio
+        // blocking threads
+        futures::stream::iter(chunks)
+            .map(|c| self.persist_tx_indices_chunk_v2(c))
+            .buffer_unordered(parallel_writes)
+            .try_collect::<Vec<_>>()
             .await
-            .map_err(|e| {
-                tracing::error!("failed to join persist_tx_indices_chunk futures: {e}");
-                IndexerError::from(e)
-            })?
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
             .map_err(|e| {
                 IndexerError::PostgresWrite(format!(
                     "Failed to persist all tx_indices chunks: {e:?}"
@@ -2378,16 +2384,39 @@ impl IndexerStore for PgIndexerStore {
         } = retain_latest_objects_from_checkpoint_batch(objects);
         let mutation_len = mutations.len();
         let deletion_len = deletions.len();
-
-        let mutation_chunks = chunk!(mutations, self.config.parallel_objects_chunk_size);
-        let deletion_chunks = chunk!(deletions, self.config.parallel_objects_chunk_size);
-        let mutation_futures = mutation_chunks
+        let parallel_writes = (self.blocking_cp.max_size() * 2) as usize;
+        let chunk_size =
+            (mutation_len / parallel_writes).clamp(self.config.parallel_objects_chunk_size, 10_000);
+        let mutation_chunks = chunk!(mutations, chunk_size);
+        let deletion_chunks = chunk!(deletions, chunk_size);
+        // Throttle the parallel write to avoid exceeding the max-number of tokio
+        // blocking threads
+        futures::stream::iter(mutation_chunks)
+            .map(|c| async move {
+                // spawn lazily
+                self.spawn_blocking_task(move |this| this.persist_changed_objects(c))
+                    .await
+            })
+            .buffer_unordered(parallel_writes)
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| {
+                tracing::error!("failed to join futures for persisting objects: {e}");
+                IndexerError::from(e)
+            })?
             .into_iter()
-            .map(|c| self.spawn_blocking_task(move |this| this.persist_changed_objects(c)));
-        let deletion_futures = deletion_chunks
-            .into_iter()
-            .map(|c| self.spawn_blocking_task(move |this| this.persist_removed_objects(c)));
-        futures::future::try_join_all(mutation_futures.chain(deletion_futures))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                IndexerError::PostgresWrite(format!("Failed to persist all object chunks: {e:?}",))
+            })?;
+        futures::stream::iter(deletion_chunks)
+            .map(|c| async move {
+                // spawn lazily
+                self.spawn_blocking_task(move |this| this.persist_removed_objects(c))
+                    .await
+            })
+            .buffer_unordered(parallel_writes)
+            .try_collect::<Vec<_>>()
             .await
             .map_err(|e| {
                 tracing::error!("failed to join futures for persisting objects: {e}");
@@ -2414,14 +2443,21 @@ impl IndexerStore for PgIndexerStore {
             .start_timer();
         let len = tx_order.len();
 
-        let chunks = chunk!(tx_order, self.config.parallel_chunk_size);
-        let futures = chunks.into_iter().map(|c| {
-            self.spawn_blocking_task(move |this| {
-                this.update_status_for_checkpoint_transactions_chunk(c)
+        let parallel_writes = (self.blocking_cp.max_size() * 2) as usize;
+        let chunk_size = (len / parallel_writes).clamp(self.config.parallel_chunk_size, 10_000);
+        let chunks = chunk!(tx_order, chunk_size);
+        // Throttle the parallel write to avoid exceeding the max-number of tokio
+        // blocking threads
+        futures::stream::iter(chunks)
+            .map(|c| async move {
+                // spawn lazily
+                self.spawn_blocking_task(move |this| {
+                    this.update_status_for_checkpoint_transactions_chunk(c)
+                })
+                .await
             })
-        });
-
-        futures::future::try_join_all(futures)
+            .buffer_unordered(parallel_writes)
+            .try_collect::<Vec<_>>()
             .await
             .map_err(|e| {
                 tracing::error!(
@@ -2454,12 +2490,19 @@ impl IndexerStore for PgIndexerStore {
             .start_timer();
         let len = tx_order.len();
 
-        let chunks = chunk!(tx_order, self.config.parallel_chunk_size);
-        let futures = chunks
-            .into_iter()
-            .map(|c| self.spawn_blocking_task(move |this| this.persist_tx_global_order_chunk(c)));
-
-        futures::future::try_join_all(futures)
+        let parallel_writes = (self.blocking_cp.max_size() * 2) as usize;
+        let chunk_size = (len / parallel_writes).clamp(self.config.parallel_chunk_size, 10_000);
+        let chunks = chunk!(tx_order, chunk_size);
+        // Throttle the parallel write to avoid exceeding the max-number of tokio
+        // blocking threads
+        futures::stream::iter(chunks)
+            .map(|c| async move {
+                // spawn lazily
+                self.spawn_blocking_task(move |this| this.persist_tx_global_order_chunk(c))
+                    .await
+            })
+            .buffer_unordered(parallel_writes)
+            .try_collect::<Vec<_>>()
             .await
             .map_err(|e| {
                 tracing::error!("failed to join persist_tx_global_order_chunk futures: {e}",);
